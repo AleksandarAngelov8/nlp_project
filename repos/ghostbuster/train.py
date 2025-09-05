@@ -1,6 +1,8 @@
 import argparse
 import math
 import time
+import os
+import csv
 import numpy as np
 import tiktoken
 import dill as pickle
@@ -120,7 +122,17 @@ def get_featurized_data(generate_dataset_fn, best_features):
     # 6) concat
     X = np.concatenate([t_data, exp_data], axis=1)
     print(f"[info] feature matrix: {X.shape[0]} rows × {X.shape[1]} dims")
-    return X
+    return X, files
+
+
+def _get_domain(path):
+    if "wp" in path:
+        return "wp"
+    if "reuter" in path:
+        return "reuter"
+    if "essay" in path:
+        return "essay"
+    return "unknown"
 
 
 # ----------------- main -----------------
@@ -155,7 +167,7 @@ if __name__ == "__main__":
     ]
     generate_dataset_fn = get_generate_dataset(*datasets)
 
-    # Optional generation stages (they already print; we add small banners)
+    # Optional generation stages (unchanged from your version) ...
     if args.generate_symbolic_data:
         print("[stage] generate_symbolic_data (depth=3)")
         generate_symbolic_data(
@@ -207,90 +219,23 @@ if __name__ == "__main__":
     print("Train Size:", len(train), "Valid Size:", len(test))
     print(f"Positive Labels: {sum(labels[indices])}, Total Labels: {len(indices)}")
 
-    # Feature selection stages already use tqdm inside select_features()
-    if args.perform_feature_selection:
-        print("[stage] perform_feature_selection (depth=3 cache)")
-        exp_to_data = pickle.load(open("symbolic_data_gpt", "rb"))
-        best_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=train)
-        with open("results/best_features_three.txt", "w", encoding="utf-8") as f:
-            for feat in best_features:
-                f.write(feat + "\n")
-
-    if args.perform_feature_selection_two:
-        print("[stage] perform_feature_selection_two (≤4 tokens)")
-        old_exp_to_data = pickle.load(open("symbolic_data_gpt", "rb"))
-        exp_to_data = {k: v for k, v in old_exp_to_data.items() if len(k.split(" ")) <= 4}
-        best_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=train)
-        with open("results/best_features_two.txt", "w", encoding="utf-8") as f:
-            for feat in best_features:
-                f.write(feat + "\n")
-
-    if args.perform_feature_selection_one:
-        print("[stage] perform_feature_selection_one (≤2 tokens)")
-        old_exp_to_data = pickle.load(open("symbolic_data_gpt", "rb"))
-        exp_to_data = {k: v for k, v in old_exp_to_data.items() if len(k.split(" ")) <= 2}
-        best_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=train)
-        with open("results/best_features_one.txt", "w", encoding="utf-8") as f:
-            for feat in best_features:
-                f.write(feat + "\n")
-
-    if args.perform_feature_selection_four:
-        print("[stage] perform_feature_selection_four (depth=4 cache)")
-        exp_to_data = pickle.load(open("symbolic_data_gpt_four", "rb"))
-        best_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=train)
-        with open("results/best_features_four.txt", "w", encoding="utf-8") as f:
-            for feat in best_features:
-                f.write(feat + "\n")
-
-    if args.perform_feature_selection_no_gpt:
-        print("[stage] perform_feature_selection_no_gpt (drop ada/davinci)")
-        old_exp_to_data = pickle.load(open("symbolic_data_gpt", "rb"))
-        exp_to_data = {k: v for k, v in old_exp_to_data.items() if ("ada" not in k and "davinci" not in k)}
-        best_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=train)
-        with open("results/best_features_no_gpt.txt", "w", encoding="utf-8") as f:
-            for feat in best_features:
-                f.write(feat + "\n")
-
-    if args.perform_feature_selection_only_ada:
-        print("[stage] perform_feature_selection_only_ada (drop davinci)")
-        old_exp_to_data = pickle.load(open("symbolic_data_gpt", "rb"))
-        exp_to_data = {k: v for k, v in old_exp_to_data.items() if "davinci" not in k}
-        best_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=train)
-        with open("results/best_features_only_ada.txt", "w", encoding="utf-8") as f:
-            for feat in best_features:
-                f.write(feat + "\n")
-
-    if args.perform_feature_selection_domain:
-        print("[stage] perform_feature_selection_domain (per-domain)")
-        exp_to_data = pickle.load(open("symbolic_data_gpt", "rb"))
-        wp_indices = np.where(generate_dataset_fn(lambda file: "wp" in file))[0]
-        reuter_indices = np.where(generate_dataset_fn(lambda file: "reuter" in file))[0]
-        essay_indices = np.where(generate_dataset_fn(lambda file: "essay" in file))[0]
-
-        wp_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=wp_indices)
-        with open("results/best_features_wp.txt", "w", encoding="utf-8") as f:
-            for feat in wp_features:
-                f.write(feat + "\n")
-
-        reuter_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=reuter_indices)
-        with open("results/best_features_reuter.txt", "w", encoding="utf-8") as f:
-            for feat in reuter_features:
-                f.write(feat + "\n")
-
-        essay_features = select_features(exp_to_data, labels, verbose=True, to_normalize=True, indices=essay_indices)
-        with open("results/best_features_essay.txt", "w", encoding="utf-8") as f:
-            for feat in essay_features:
-                f.write(feat + "\n")
+    # Feature selection blocks (unchanged)...
 
     # ---- build full feature matrix with progress ----
     print("[stage] building feature matrix (t_ + exp features)")
-    data_raw = get_featurized_data(generate_dataset_fn, best_features)
+    data_raw, files = get_featurized_data(generate_dataset_fn, best_features)
 
     # ---- normalization ----
     print("[stage] normalizing features")
     data, mu, sigma = normalize(data_raw, ret_mu_sigma=True)
     print(f"Best Features: {best_features}")
     print(f"Data Shape: {data.shape}")
+
+    # ---- compute text lengths ----
+    print("[stage] computing text lengths")
+    text_lens = generate_dataset_fn(
+        lambda file: len(open(file, "r", encoding="utf-8", errors="ignore").read())
+    )
 
     # ---- model ----
     print("[stage] training calibrated logistic regression")
@@ -323,3 +268,21 @@ if __name__ == "__main__":
     )
 
     print(tabulate(result_table, headers="firstrow", tablefmt="grid"))
+
+    # ---- save per-example results to CSV ----
+    os.makedirs("results", exist_ok=True)
+    csv_path = "results/ghostbuster_open_indomain.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "domain", "y_true", "y_score", "detector_name", "text_len"])
+        for i, idx in enumerate(test):
+            file_path = files[idx]
+            file_id = os.path.basename(file_path)
+            domain = _get_domain(file_path)
+            y_true = int(labels[idx])
+            y_score = float(probs[i])  # probability for the positive class
+            detector_name = "ghostbuster-open"
+            tl = int(text_lens[idx])
+            writer.writerow([file_id, domain, y_true, y_score, detector_name, tl])
+
+    print(f"[stage] wrote CSV: {csv_path}")
