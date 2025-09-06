@@ -28,6 +28,10 @@ def parse_args():
                     help="Force device. Default: auto-detect.")
     ap.add_argument("--out", default="outputs/ghostbuster_open/hc3_from_gb.csv",
                     help="Output CSV path.")
+    # NEW: optional decision threshold (default -1 = don't apply / don't add columns)
+    ap.add_argument("--threshold", type=float, default=-1.0,
+                    help="Decision threshold for classifying AI vs human. "
+                         "If >= 0, additional columns pred_label and threshold_used are written.")
     return ap.parse_args()
 
 def load_hc3_all():
@@ -98,7 +102,7 @@ def fmt_eta(seconds: float) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def score_split(texts, label, prefix, best_features, trigram_model, enc_for_trigram, tok, mdl, max_ctx, writer):
+def score_split(texts, label, prefix, best_features, trigram_model, enc_for_trigram, tok, mdl, max_ctx, writer, threshold):
     # EMA-based ETA
     ema_row_sec = None
     alpha = 0.2
@@ -106,13 +110,22 @@ def score_split(texts, label, prefix, best_features, trigram_model, enc_for_trig
     pbar = tqdm(total=len(texts), desc=f"{prefix} ({'human' if label==0 else 'ai'})", unit="doc")
     written = 0
 
+    # If thresholding is enabled, we’ll write 2 extra columns (pred_label, threshold_used)
+    use_threshold = (threshold is not None) and (threshold >= 0.0)
+
     for i, txt in enumerate(texts):
         t0 = time.perf_counter()
         rid = f"{prefix}_{i:08d}"
         txt = (txt or "").strip()
         feats = build_feature_vector(txt, best_features, trigram_model, enc_for_trigram, tok, mdl, max_ctx)
         pred = MODEL.predict_proba(((feats - MU) / SIGMA).reshape(1, -1))[:, 1][0]
-        writer.writerow([rid, "hc3", label, f"{pred:.6f}", "ghostbuster-open", len(txt)])
+
+        if use_threshold:
+            yhat = int(pred >= threshold)
+            writer.writerow([rid, "hc3", label, f"{pred:.6f}", "ghostbuster-open", len(txt), yhat, f"{threshold:.6f}"])
+        else:
+            writer.writerow([rid, "hc3", label, f"{pred:.6f}", "ghostbuster-open", len(txt)])
+
         written += 1
 
         dt = time.perf_counter() - t0
@@ -180,11 +193,18 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["id","domain","y_true","y_score","detector_name","text_len"])
+
+        # Header: original 6 columns, plus 2 optional if --threshold was supplied
+        if args.threshold is not None and args.threshold >= 0.0:
+            w.writerow(["id","domain","y_true","y_score","detector_name","text_len","pred_label","threshold_used"])
+            print(f"[info] Thresholding enabled @ {args.threshold:.6f} (extra columns will be written).")
+        else:
+            w.writerow(["id","domain","y_true","y_score","detector_name","text_len"])
+            print("[info] Thresholding disabled (writing original 6-column format).")
 
         print(f"[info] Humans: {len(humans)} | AI: {len(ais)} | Output: {out}")
-        wrote_h = score_split(humans, 0, "hc3_h", best_features, trigram_model, enc_for_trigram, tok, mdl, args.max_ctx, w)
-        wrote_a = score_split(ais,    1, "hc3_a", best_features, trigram_model, enc_for_trigram, tok, mdl, args.max_ctx, w)
+        wrote_h = score_split(humans, 0, "hc3_h", best_features, trigram_model, enc_for_trigram, tok, mdl, args.max_ctx, w, args.threshold)
+        wrote_a = score_split(ais,    1, "hc3_a", best_features, trigram_model, enc_for_trigram, tok, mdl, args.max_ctx, w, args.threshold)
 
     print(f"[DONE] wrote {wrote_h + wrote_a} rows → {out}")
 

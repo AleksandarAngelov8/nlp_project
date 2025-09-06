@@ -1,25 +1,31 @@
-# binoculars_ghostbuster_wiki_reuter.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os, sys, csv, glob, hashlib, random, argparse, math, time, warnings
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
-import pandas as pd
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.utils.logging import set_verbosity_error
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, average_precision_score
 
-# Silence HF’s chatty warnings and the long-sequence message
+# Quiet HF warnings
 set_verbosity_error()
 warnings.filterwarnings(
     "ignore",
     message="Token indices sequence length is longer than the specified maximum",
 )
 
+# Sensible speed defaults
 DEFAULT_SMALL = "distilgpt2"
 DEFAULT_LARGE = "gpt2-medium"
-DEFAULT_MAX_CTX = 256
-DEFAULT_OVERLAP = 32
-DEFAULT_BATCH = 1
-CHECKPOINT_EVERY = 100
+DEFAULT_MAX_CTX = 128
+DEFAULT_OVERLAP = 8
+DEFAULT_BATCH = 8
+EPS = 1e-9
 
 def read_text(path: str) -> str:
     for enc in ("utf-8", "utf-8-sig", "latin-1"):
@@ -44,10 +50,7 @@ def _has_txt(base: str) -> bool:
         os.path.join(base, "gpt_writing", "**", "*.txt"),
         os.path.join(base, "claude", "**", "*.txt"),
     ]
-    for p in pats:
-        if glob.glob(p, recursive=True):
-            return True
-    return False
+    return any(glob.glob(p, recursive=True) for p in pats)
 
 def resolve_domain_base(root_dir: str, domain: str, data_root: str | None) -> str:
     candidates = []
@@ -56,7 +59,6 @@ def resolve_domain_base(root_dir: str, domain: str, data_root: str | None) -> st
             candidates.append(data_root)
         else:
             candidates.append(os.path.join(data_root, domain))
-    # IMPORTANT: include ghostbuster/data/<domain> (your layout)
     candidates += [
         os.path.join(root_dir, "ghostbuster", "data", domain),
         os.path.join(root_dir, "data", "ghostbuster-data", domain),
@@ -71,8 +73,7 @@ def resolve_domain_base(root_dir: str, domain: str, data_root: str | None) -> st
         if os.path.isdir(c) and _has_txt(c):
             return c
     raise FileNotFoundError(
-        "Could not find any *.txt files for domain '{d}'. Tried:\n  - "
-        + "\n  - ".join(tried)
+        f"Could not find *.txt files for domain '{domain}'. Tried:\n  - " + "\n  - ".join(tried)
     )
 
 def load_ghostbuster_paths(root_dir: str, domain: str, data_root: str | None):
@@ -84,7 +85,7 @@ def load_ghostbuster_paths(root_dir: str, domain: str, data_root: str | None):
         ai_paths.extend(glob.glob(os.path.join(base, d, "**", "*.txt"), recursive=True))
     ai_paths = sorted(ai_paths)
     print("Using domain base:", base)
-    print("#human txt:", len(human_paths), "| #ai txt:", len(ai_paths))
+    print("#human txt:", len(human_paths), " | #ai txt:", len(ai_paths))
     if not human_paths or not ai_paths:
         raise FileNotFoundError(
             f"No files found for one or both classes under {base}.\n"
@@ -99,60 +100,6 @@ def balanced_sample(human_paths, ai_paths, n_per_class, seed=42):
     n = min(n_per_class, len(human_paths), len(ai_paths))
     return human_paths[:n], ai_paths[:n]
 
-def _safe_texts_for_tok(texts, tok):
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    eos = tok.eos_token or " "
-    out = []
-    for t in texts:
-        s = (t or "").strip()
-        out.append(s if s else eos)
-    return out
-
-@torch.inference_mode()
-def nll_one_sliding(text: str, tok, model, device, max_ctx: int, overlap: int) -> float:
-    try:
-        tok.model_max_length = int(1e9)  # avoid tokenizer length warnings
-    except Exception:
-        pass
-
-    ids = tok.encode(text, add_special_tokens=False)
-    if len(ids) < 2:
-        if tok.eos_token_id is not None:
-            ids = ids + [tok.eos_token_id]
-        else:
-            ids = ids + [ids[-1] if ids else 0]
-
-    step = max(1, max_ctx - overlap)
-    total_loss, total_tokens = 0.0, 0
-
-    for start in range(0, len(ids), step):
-        chunk_ids = ids[start : start + max_ctx]
-        if len(chunk_ids) < 2:
-            break
-        input_ids = torch.tensor(chunk_ids, dtype=torch.long, device=device).unsqueeze(0)
-        attn = torch.ones_like(input_ids, device=device)
-        logits = model(input_ids=input_ids, attention_mask=attn).logits
-        logits = logits[:, :-1, :]
-        labels = input_ids[:, 1:]
-        mask   = attn[:, 1:]
-        loss_tok = F.cross_entropy(logits.transpose(1, 2), labels, reduction="none")
-        loss_tok = loss_tok * mask
-        valid = int(mask.sum().item())
-        if valid > 0:
-            total_loss  += float(loss_tok.sum().item())
-            total_tokens += valid
-        if start + max_ctx >= len(ids):
-            break
-
-    if total_tokens == 0:
-        return 0.0
-    return total_loss / total_tokens
-
-def avg_nll_sliding(model, tok, texts, device, max_ctx: int, overlap: int):
-    texts = _safe_texts_for_tok(texts, tok)
-    return [nll_one_sliding(t, tok, model, device, max_ctx, overlap) for t in texts]
-
 def _fmt_eta(secs: float) -> str:
     if secs is None or math.isnan(secs) or math.isinf(secs) or secs < 0:
         return "--:--:--"
@@ -161,52 +108,147 @@ def _fmt_eta(secs: float) -> str:
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+# ---------- Tokenization & windowing ----------
+def ids_from_text(tok, text: str):
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    ids = tok.encode(text or "", add_special_tokens=False)
+    if len(ids) < 2:
+        ids = ids + [tok.eos_token_id if tok.eos_token_id is not None else (ids[-1] if ids else 0)]
+    return ids
+
+def windows_from_ids(ids, max_ctx: int, overlap: int):
+    step = max(1, max_ctx - overlap)
+    out = []
+    for start in range(0, len(ids), step):
+        chunk = ids[start:start+max_ctx]
+        if len(chunk) < 2: break
+        out.append(chunk)
+        if start + max_ctx >= len(ids): break
+    return out
+
+@torch.inference_mode()
+def nll_windows_batched(model, device, windows, batch_size: int):
+    total_loss, total_tokens = 0.0, 0
+    if not windows: return 0.0, 0
+    i = 0
+    while i < len(windows):
+        batch = windows[i:i+batch_size]
+        max_len = max(len(x) for x in batch)
+        input_ids = torch.full((len(batch), max_len), 0, dtype=torch.long, device=device)
+        attn      = torch.zeros_like(input_ids, dtype=torch.long, device=device)
+        for r, seq in enumerate(batch):
+            L = len(seq)
+            input_ids[r, :L] = torch.tensor(seq, dtype=torch.long, device=device)
+            attn[r, :L] = 1
+        logits = model(input_ids=input_ids, attention_mask=attn).logits
+        logits = logits[:, :-1, :]
+        labels = input_ids[:, 1:]
+        mask   = attn[:, 1:]
+        loss_tok = F.cross_entropy(logits.transpose(1, 2), labels, reduction="none")
+        loss_tok = loss_tok * mask
+        total_loss  += float(loss_tok.sum().item())
+        total_tokens += int(mask.sum().item())
+        i += batch_size
+    return total_loss, total_tokens
+
+def nll_one_text(model, tok, device, ids, max_ctx: int, overlap: int, batch_windows: int) -> float:
+    windows = windows_from_ids(ids, max_ctx, overlap)
+    total_loss, total_tokens = nll_windows_batched(model, device, windows, batch_windows)
+    return (total_loss / total_tokens) if total_tokens > 0 else 0.0
+
+# ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=str, default=os.path.abspath("."), help="Project root")
-    ap.add_argument("--data_root", type=str, default=None,
-                    help="Path to folder containing essay/reuter/wp or directly the domain folder")
+    ap.add_argument("--data_root", type=str, default=None, help="Folder containing essay/reuter/wp or the domain folder directly")
     ap.add_argument("--domain", type=str, required=True, choices=["essay","reuter","wp"])
     ap.add_argument("--n_per_class", type=int, default=1000)
     ap.add_argument("--out", type=str, required=True)
+
     ap.add_argument("--max_ctx", type=int, default=DEFAULT_MAX_CTX)
     ap.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP)
-    ap.add_argument("--batch", type=int, default=DEFAULT_BATCH)
+    ap.add_argument("--batch_windows", type=int, default=DEFAULT_BATCH)
+
     ap.add_argument("--small_model", type=str, default=DEFAULT_SMALL)
     ap.add_argument("--large_model", type=str, default=DEFAULT_LARGE)
     ap.add_argument("--large_on_cpu", action="store_true")
-    ap.add_argument("--log_every", type=int, default=50, help="Print heartbeat every N files")
+    ap.add_argument("--mode", type=str, default="two_pass", choices=["two_pass","interleaved"])
+
+    # Auto-tune & I/O
+    ap.add_argument("--auto_metric", type=str, default="f1", choices=["f1","accuracy","youden"],
+                    help="Metric to optimize when choosing threshold.")
+    ap.add_argument("--flip_if_better", action="store_true",
+                    help="If ROC-AUC improves by flipping the score sign, flip it.")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Overwrite output instead of resuming (recommended).")
+    ap.add_argument("--write_shifted", action="store_true",
+                    help="Write y_score = shifted score so that 0.0 == tuned threshold.")
+    # Manual threshold (skip auto-tune if set)
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="Manual threshold on raw score (nll_small - nll_large).")
+    # Speed/quantization
+    ap.add_argument("--load_8bit", action="store_true", help="Load models in 8-bit (bitsandbytes)")
+    ap.add_argument("--load_4bit", action="store_true", help="Load models in 4-bit (bitsandbytes)")
+    ap.add_argument("--no_sdpa", action="store_true", help="Disable SDPA attention")
     args = ap.parse_args()
 
     out_path = args.out
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    small_device = "cuda" if torch.cuda.is_available() else "cpu"
-    large_device = "cpu" if args.large_on_cpu else small_device
+    # Devices
+    cuda = torch.cuda.is_available()
+    small_device = "cuda" if cuda else "cpu"
+    large_device = "cpu" if args.large_on_cpu else ("cuda" if cuda else "cpu")
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     print(f"Small device: {small_device} | Large device: {large_device}")
     print(f"Models: small='{args.small_model}'  large='{args.large_model}'")
-    print(f"Sliding windows: max_ctx={args.max_ctx}, overlap={args.overlap}")
+    print(f"ctx={args.max_ctx}, overlap={args.overlap}, batch_windows={args.batch_windows}")
+    print(f"Quantization: 8bit={args.load_8bit}  4bit={args.load_4bit}  SDPA={'off' if args.no_sdpa else 'on'}")
 
-    tok_s = AutoTokenizer.from_pretrained(args.small_model, use_fast=True)
-    tok_l = AutoTokenizer.from_pretrained(args.large_model, use_fast=True)
-    if tok_s.pad_token is None: tok_s.pad_token = tok_s.eos_token
-    if tok_l.pad_token is None: tok_l.pad_token = tok_l.eos_token
+    # Tokenizer
+    tok = AutoTokenizer.from_pretrained(args.small_model, use_fast=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
 
-    if small_device == "cuda":
-        mdl_s = AutoModelForCausalLM.from_pretrained(
-            args.small_model, dtype=torch.float16, device_map={"": small_device}
-        ).eval()
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
-    else:
-        mdl_s = AutoModelForCausalLM.from_pretrained(args.small_model).to(small_device).eval()
+    def load_model(name, device):
+        kw = {}
+        if not args.no_sdpa:
+            kw["attn_implementation"] = "sdpa"
+        if device == "cuda":
+            if args.load_4bit or args.load_8bit:
+                try:
+                    from transformers import BitsAndBytesConfig
+                except Exception:
+                    print("[warn] bitsandbytes not installed; ignoring --load_4bit/--load_8bit")
+                else:
+                    if args.load_4bit:
+                        bnb = BitsAndBytesConfig(
+                            load_in_4bit=True, bnb_4bit_use_double_quant=True,
+                            bnb_4bit_compute_dtype=torch.float16, bnb_4bit_quant_type="nf4"
+                        )
+                        return AutoModelForCausalLM.from_pretrained(
+                            name, device_map="auto", quantization_config=bnb, low_cpu_mem_usage=True, **kw
+                        ).eval()
+                    if args.load_8bit:
+                        bnb = BitsAndBytesConfig(load_in_8bit=True)
+                        return AutoModelForCausalLM.from_pretrained(
+                            name, device_map="auto", quantization_config=bnb, low_cpu_mem_usage=True, **kw
+                        ).eval()
+            mdl = AutoModelForCausalLM.from_pretrained(
+                name, torch_dtype=torch.float16, low_cpu_mem_usage=True, **kw
+            ).to(device).eval()
+            try: torch.set_float32_matmul_precision("high")
+            except Exception: pass
+            return mdl
+        else:
+            return AutoModelForCausalLM.from_pretrained(name, low_cpu_mem_usage=True, **kw).to(device).eval()
 
-    mdl_l = AutoModelForCausalLM.from_pretrained(
-        args.large_model, dtype=(torch.float16 if large_device == "cuda" else None)
-    ).to(large_device).eval()
-
+    # Data (always build fresh item list; we overwrite unless told otherwise)
     human_paths, ai_paths = load_ghostbuster_paths(args.root, args.domain, args.data_root)
     h_sel, a_sel = balanced_sample(human_paths, ai_paths, args.n_per_class)
     rows = (
@@ -215,84 +257,145 @@ def main():
     )
     random.shuffle(rows)
 
-    done_keys = set()
-    if os.path.exists(out_path):
-        print(f"[INFO] Resuming from {out_path}")
-        df_done = pd.read_csv(out_path)
-        if "text_hash" in df_done.columns:
-            done_keys = set(df_done["text_hash"].astype(str).tolist())
-        elif "path" in df_done.columns:
-            done_keys = set(df_done["path"].astype(str).tolist())
-    else:
-        with open(out_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["path","text_hash","label","nll_small","nll_large","score","pred","src","kind"])
+    items = []
+    for r in tqdm(rows, desc="Reading & tokenizing", unit="file"):
+        text = read_text(r["path"])
+        thash = sha1(text)
+        ids = ids_from_text(tok, text)
+        items.append((r, thash, ids))
 
-    start = time.perf_counter()
-    ema_s_per_row = None
-    ema_alpha = 0.3
-    processed_new = 0
-    wrote_since_flush = 0
-
-    with open(out_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        pbar = tqdm(
-            rows, desc=f"Binoculars on GB-{args.domain} (ctx={args.max_ctx}, overlap={args.overlap})",
-            unit="file", miniters=1, mininterval=0.3, smoothing=0.1, dynamic_ncols=True
-        )
-
-        for idx, r in enumerate(pbar, 1):
-            if r["path"] in done_keys:
-                continue
-
+    # Scoring passes
+    @torch.inference_mode()
+    def compute_all_nlls(name, device, tag):
+        nll_map = {}
+        mdl = load_model(name, device)
+        pbar = tqdm(items, desc=f"{tag} pass ({name} on {device})", unit="file")
+        ema = None; alpha = 0.3
+        for (r, thash, ids) in pbar:
             t0 = time.perf_counter()
-            text = read_text(r["path"])
-            thash = sha1(text)
-            if thash in done_keys:
-                continue
-
             try:
-                a = nll_one_sliding(text, tok_s, mdl_s, next(mdl_s.parameters()).device, args.max_ctx, args.overlap)
-                b = nll_one_sliding(text, tok_l, mdl_l, next(mdl_l.parameters()).device, args.max_ctx, args.overlap)
-                score = a - b
-                pred  = int(score > 0)
-                w.writerow([r["path"], thash, r["label"],
-                            f"{a:.6f}", f"{b:.6f}", f"{score:.6f}", pred, r["src"], r["kind"]])
+                nll = nll_one_text(mdl, tok, device, ids, args.max_ctx, args.overlap, args.batch_windows)
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    print("\n[ERROR] CUDA OOM. Reduce --max_ctx (e.g., 192/128) and/or try --large_on_cpu.")
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+                    print("\n[ERROR] CUDA OOM. Try --max_ctx 96/64, --batch_windows 4/2, or quantize.")
                     sys.exit(1)
-                # write a row marking failure & continue
-                w.writerow([r["path"], thash, r["label"], "", "", "", "", r["src"], r["kind"]])
-            except Exception as e:
-                # keep going on random decoding/model errors
-                w.writerow([r["path"], thash, r["label"], "", "", "", "", r["src"], r["kind"]])
-
-            wrote_since_flush += 1
-            processed_new += 1
+                nll = float("nan")
+            except Exception:
+                nll = float("nan")
+            nll_map[thash] = nll
             dt = time.perf_counter() - t0
-            s_per_row = dt
-            ema_s_per_row = s_per_row if ema_s_per_row is None else ema_alpha * s_per_row + (1 - ema_alpha) * ema_s_per_row
-            remained = max(len(rows) - processed_new, 0)
-            eta_sec = remained * (ema_s_per_row or 0.0)
-            pbar.set_postfix({
-                "r/s": f"{(1.0/(ema_s_per_row or 1e-9)):.2f}",
-                "ETA": _fmt_eta(eta_sec),
-            })
+            ema = dt if ema is None else (alpha*dt + (1-alpha)*ema)
+            remain = len(items) - len(nll_map)
+            pbar.set_postfix({"r/s": f"{(1.0/(ema or 1e-9)):.2f}", "ETA": _fmt_eta(remain*(ema or 0.0))})
+        del mdl
+        if device == "cuda": torch.cuda.empty_cache()
+        return nll_map
 
-            if wrote_since_flush >= CHECKPOINT_EVERY:
-                f.flush(); os.fsync(f.fileno()); wrote_since_flush = 0
+    nll_small = compute_all_nlls(args.small_model, "cuda" if torch.cuda.is_available() else "cpu", "small")
+    nll_large = compute_all_nlls(args.large_model, "cuda" if torch.cuda.is_available() and not args.large_on_cpu else "cpu", "large")
 
-            # heartbeat
-            if args.log_every > 0 and (processed_new % args.log_every == 0):
-                print(f"[{processed_new}/{len(rows)}] ~{(1.0/(ema_s_per_row or 1e-9)):.2f} r/s | ETA {_fmt_eta(eta_sec)}")
+    # Build arrays
+    y_true, s_raw, nll_s_arr, nll_l_arr, keep = [], [], [], [], []
+    for (r, thash, ids) in items:
+        a = nll_small.get(thash, float("nan"))
+        b = nll_large.get(thash, float("nan"))
+        if math.isnan(a) or math.isnan(b):
+            continue
+        y_true.append(int(r["label"]))
+        s_raw.append(a - b)
+        nll_s_arr.append(a)
+        nll_l_arr.append(b)
+        keep.append((r, thash))
 
-        f.flush(); os.fsync(f.fileno())
+    y_true = np.array(y_true, dtype=int)
+    s = np.array(s_raw, dtype=float)
 
-    elapsed = time.perf_counter() - start
-    print(f"[DONE] Wrote {out_path} | processed={processed_new} | elapsed {elapsed:.1f}s")
+    # Optional sign flip
+    if args.flip_if_better and len(np.unique(y_true)) == 2:
+        try:
+            auc_pos = roc_auc_score(y_true, s)
+            auc_neg = roc_auc_score(y_true, -s)
+            if auc_neg > auc_pos:
+                s = -s
+                print(f"[auto] Flipped score sign (AUC {auc_neg:.3f} > {auc_pos:.3f})")
+        except Exception:
+            pass
 
+    # Threshold: manual or auto sweep
+    if args.threshold is not None:
+        thr = float(args.threshold)
+        metric_name = "manual"
+        yhat = (s >= thr).astype(int)
+        best_f1  = f1_score(y_true, yhat, zero_division=0)
+        best_acc = accuracy_score(y_true, yhat)
+    else:
+        uniq = np.unique(s[~np.isnan(s)])
+        if len(uniq) > 4000:
+            idx = np.linspace(0, len(uniq)-1, 4000, dtype=int)
+            thr_grid = uniq[idx]
+        else:
+            thr_grid = uniq
+        best = {"thr": None, "val": -1.0, "acc": None, "f1": None}
+        for t in thr_grid:
+            yhat = (s >= t).astype(int)
+            acc  = accuracy_score(y_true, yhat)
+            f1   = f1_score(y_true, yhat, zero_division=0)
+            if args.auto_metric == "accuracy":
+                score_val = acc
+            elif args.auto_metric == "youden":
+                tn = ((y_true==0)&(yhat==0)).sum()
+                fp = ((y_true==0)&(yhat==1)).sum()
+                fn = ((y_true==1)&(yhat==0)).sum()
+                tp = ((y_true==1)&(yhat==1)).sum()
+                tpr = tp/(tp+fn) if (tp+fn)>0 else 0
+                tnr = tn/(tn+fp) if (tn+fp)>0 else 0
+                score_val = tpr + tnr - 1
+            else:
+                score_val = f1
+            if score_val > best["val"]:
+                best = {"thr": float(t), "val": float(score_val), "acc": float(acc), "f1": float(f1)}
+        thr = best["thr"]; best_f1 = best["f1"]; best_acc = best["acc"]; metric_name = args.auto_metric
+
+    # Threshold-free metrics
+    try:
+        roc_auc = roc_auc_score(y_true, s)
+        pr_auc  = average_precision_score(y_true, s)
+    except Exception:
+        roc_auc = float("nan"); pr_auc = float("nan")
+
+    pos_rate = float((s >= thr).mean())
+    print("\n=== Binoculars summary ===")
+    print(f" ROC-AUC={roc_auc:.4f}  PR-AUC={pr_auc:.4f}")
+    print(f" Best-{metric_name} threshold={thr:.6f}  F1={best_f1:.4f}  ACC={best_acc:.4f}  pos-rate={pos_rate:.3f}")
+
+    # Write output (OVERWRITE by default)
+    if os.path.exists(out_path) and not args.overwrite:
+        print(f"[WARN] {out_path} exists. Use --overwrite to replace. Writing *_new.csv instead.")
+        base, ext = os.path.splitext(out_path)
+        out_path = f"{base}_new{ext}"
+
+    header = ["path","text_hash","label","nll_small","nll_large","score_raw","y_score","pred","src","kind"]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for (i, ((r, thash))) in enumerate(keep):
+            a = nll_s_arr[i]; b = nll_l_arr[i]
+            score_raw = s[i]
+            y_score = score_raw - thr if args.write_shifted else score_raw
+            pred = int((y_score if args.write_shifted else score_raw) >= (0.0 if args.write_shifted else thr))
+            w.writerow([
+                r["path"], thash, r["label"],
+                f"{a:.6f}", f"{b:.6f}",
+                f"{score_raw:.6f}", f"{y_score:.6f}",
+                pred, r["src"], r["kind"]
+            ])
+
+    print(f"[DONE] Wrote {len(keep)} rows → {out_path}")
+    print("Columns: score_raw = (nll_small - nll_large) [maybe sign-flipped], y_score = score_raw - threshold (if --write_shifted).")
+    print("Your evaluator that thresholds at 0.0 should read y_score when --write_shifted is used.")
+    if not args.write_shifted:
+        print("Tip: pass --write_shifted so 0.0 equals the tuned threshold and you avoid 'all 1s'.")
+    
 if __name__ == "__main__":
     main()

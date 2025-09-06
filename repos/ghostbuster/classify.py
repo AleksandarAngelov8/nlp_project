@@ -11,6 +11,8 @@ from utils.symbolic import train_trigram, get_words, vec_functions, scalar_funct
 parser = argparse.ArgumentParser()
 parser.add_argument("--file", type=str, default="input.txt")
 parser.add_argument("--openai_key", type=str, default="")
+parser.add_argument("--threshold", type=float, default=0.5,
+                    help="Decision threshold for classifying AI vs human")
 args = parser.parse_args()
 
 if args.openai_key != "":
@@ -95,4 +97,9 @@ for exp in best_features:
 data = (np.array(t_features + exp_features) - mu) / sigma
 preds = model.predict_proba(data.reshape(-1, 1).T)[:, 1]
 
-print(f"Prediction: {preds}")
+# Apply threshold
+prob = preds[0]
+label = int(prob >= args.threshold)
+
+print(f"Probability (AI-generated): {prob:.4f}")
+print(f"Predicted label (threshold={args.threshold}): {label}")
