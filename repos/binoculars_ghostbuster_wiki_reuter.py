@@ -21,7 +21,7 @@ warnings.filterwarnings(
 
 # Sensible speed defaults
 DEFAULT_SMALL = "distilgpt2"
-DEFAULT_LARGE = "gpt2-medium"
+DEFAULT_LARGE = "gpt2-large"
 DEFAULT_MAX_CTX = 128
 DEFAULT_OVERLAP = 8
 DEFAULT_BATCH = 8
