@@ -1,0 +1,14 @@
+Metric,Value
+ROC AUC,0.6997
+PR AUC (AP),0.9646
+F1 @ 0.5,0.95
+ACC @ 0.5,0.9049
+Best F1,0.9581
+ACC @ Best F1,0.9195
+Best-F1 Threshold,0.0
+Recall @ 1% FPR,0.0
+Recall @ 5% FPR,0.3146
+F1 @ 5% FPR,0.4771
+ACC @ 5% FPR,0.366
+Threshold @ 5% FPR,0.999999
+Rows,50000.0
